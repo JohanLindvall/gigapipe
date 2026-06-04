@@ -93,6 +93,33 @@ func TestUngroupedAggSkipsLabelsJoin(t *testing.T) {
 	}
 }
 
+// count() ignores sample values, so pre_agg must not decode them with
+// argMaxMerge; sum() must still decode them.
+func TestCountSkipsValueDecode(t *testing.T) {
+	for _, q := range []string{`count({__name__=~".+"})`, `count by (job) (http_requests_total)`} {
+		if str := renderAggPushdown(t, q); strings.Contains(str, "argMaxMerge") {
+			t.Fatalf("%s: count should not decode values (argMaxMerge), got: %s", q, str)
+		}
+	}
+	if str := renderAggPushdown(t, `sum({__name__=~".+"})`); !strings.Contains(str, "argMaxMerge(last)") {
+		t.Fatalf("sum must still decode values, got: %s", str)
+	}
+}
+
+// The ungrouped labels row must not re-reference pre_agg, otherwise ClickHouse
+// re-inlines it and scans metrics_15s twice. It is sourced from the fp CTE.
+func TestUngroupedLabelsRowAvoidsDoubleScan(t *testing.T) {
+	str := renderAggPushdown(t, `count({__name__=~".+"})`)
+	// "pre_agg" appears once as the CTE definition and once where the samples are
+	// counted — but never a third time for the labels row.
+	if n := strings.Count(str, "pre_agg"); n != 2 {
+		t.Fatalf("expected pre_agg referenced exactly twice (def + count), got %d: %s", n, str)
+	}
+	if !strings.Contains(str, "'{}' as labels FROM fp LIMIT 1") {
+		t.Fatalf("expected labels row sourced from fp, got: %s", str)
+	}
+}
+
 // Grouping by labels (by / without) must still use the labels_req join.
 func TestGroupedAggKeepsLabelsJoin(t *testing.T) {
 	for _, q := range []string{

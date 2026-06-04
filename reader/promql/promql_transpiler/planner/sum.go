@@ -26,6 +26,13 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 		return nil, err
 	}
 
+	// count() ignores sample values, so drop the argMaxMerge(last) decode from
+	// pre_agg: the value column is never merged, and not even read from
+	// metrics_15s. Grouped or not, the outer count() only counts rows.
+	if s.Fn == "count" {
+		main = dropValue(main)
+	}
+
 	// Ungrouped aggregation — `count(x)`/`sum(x)` with no by/without, or `by ()` —
 	// collapses every series into a single empty-labelled output series. In that
 	// case the new labels are a constant `{}`, so we can skip both getLabels and
@@ -40,13 +47,7 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 // relabelled time_series fingerprints (labels_req) to compute group membership.
 func (s *AggPlanner) processGrouped(main sql.ISelect, patchVal sql.SQLObject,
 	ctx *shared.PlannerContext) (sql.ISelect, error) {
-	var withFp *sql.With
-	for _, w := range main.GetWith() {
-		if w.GetAlias() == "fp" {
-			withFp = w
-			break
-		}
-	}
+	withFp := findWith(main, "fp")
 	if withFp == nil {
 		return nil, fmt.Errorf("could not find fingerprint subquery")
 	}
@@ -84,10 +85,17 @@ func (s *AggPlanner) processNoGrouping(main sql.ISelect, patchVal sql.SQLObject)
 		GroupBy(ts).
 		OrderBy(asc(ts))
 
-	// One labels row, emitted only when there is at least one sample (LIMIT 1),
-	// matching the grouped path which produces label rows only for real series.
+	// One labels row for the single output series. Source it from the fingerprint
+	// CTE (fp) rather than pre_agg: a second reference to pre_agg would re-inline
+	// it (ClickHouse does not materialize WITH) and scan metrics_15s twice. fp is
+	// the cheap GIN scan and, like the grouped path's labels_req, yields a row per
+	// existing series — so LIMIT 1 emits the labels row iff any series exists.
+	labelsFrom := sql.NewWithRef(withMain)
+	if withFp := findWith(main, "fp"); withFp != nil {
+		labelsFrom = sql.NewWithRef(withFp)
+	}
 	labelsReq := labelsRow(fp, sql.NewRawObject("'{}'")).
-		From(sql.NewWithRef(withMain)).
+		From(labelsFrom).
 		Limit(sql.NewIntVal(1))
 
 	return aggResult(values, labelsReq, withMain)
@@ -126,6 +134,31 @@ func aggResult(values, labelsReq sql.ISelect, withs ...*sql.With) sql.ISelect {
 
 func asc(col sql.SQLObject) sql.SQLObject {
 	return sql.NewOrderBy(col, sql.ORDER_BY_DIRECTION_ASC)
+}
+
+// findWith returns the named CTE declared on req (including hoisted ones), or nil.
+func findWith(req sql.ISelect, alias string) *sql.With {
+	for _, w := range req.GetWith() {
+		if w.GetAlias() == alias {
+			return w
+		}
+	}
+	return nil
+}
+
+// dropValue removes the `val` column from a select. count() ignores sample
+// values, so pre_agg can skip the argMaxMerge(last) decode — the value's
+// aggregate-state column is then never read from metrics_15s.
+func dropValue(req sql.ISelect) sql.ISelect {
+	cols := req.GetSelect()
+	kept := make([]sql.SQLObject, 0, len(cols))
+	for _, c := range cols {
+		if a, ok := c.(sql.Aliased); ok && a.GetAlias() == "val" {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return req.Select(kept...)
 }
 
 func (s *AggPlanner) getLabels(withFp *sql.With, ctx *shared.PlannerContext) sql.ISelect {
