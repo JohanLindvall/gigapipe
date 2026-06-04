@@ -69,3 +69,40 @@ func TestSumPushdownStillWorks(t *testing.T) {
 		t.Fatalf("expected sum(val) aggregate, got: %s", str)
 	}
 }
+
+// Ungrouped aggregation collapses to a single empty-labelled series, so the
+// labels_req join against time_series must be skipped entirely.
+func TestUngroupedAggSkipsLabelsJoin(t *testing.T) {
+	for _, q := range []string{
+		`count({__name__=~".+"})`,
+		`sum({__name__=~".+"})`,
+		`count by () (http_requests_total)`,
+	} {
+		str := renderAggPushdown(t, q)
+		if strings.Contains(str, "labels_req") {
+			t.Fatalf("%s: expected no labels_req join, got: %s", q, str)
+		}
+		// "FROM time_series " (trailing space) matches the labels scan but not the
+		// "time_series_gin" fingerprint table (next char is '_').
+		if strings.Contains(str, "FROM time_series ") {
+			t.Fatalf("%s: expected no time_series scan, got: %s", q, str)
+		}
+		if !strings.Contains(str, "cityHash64('{}')") {
+			t.Fatalf("%s: expected constant empty-labels fingerprint, got: %s", q, str)
+		}
+	}
+}
+
+// Grouping by labels (by / without) must still use the labels_req join.
+func TestGroupedAggKeepsLabelsJoin(t *testing.T) {
+	for _, q := range []string{
+		`count by (job) (http_requests_total)`,
+		`count without () (http_requests_total)`,
+		`sum by (job) (http_requests_total)`,
+	} {
+		str := renderAggPushdown(t, q)
+		if !strings.Contains(str, "labels_req") {
+			t.Fatalf("%s: expected labels_req join for grouped aggregation, got: %s", q, str)
+		}
+	}
+}

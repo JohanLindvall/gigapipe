@@ -21,6 +21,19 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 		return nil, err
 	}
 
+	patchVal, err := s.patchVal()
+	if err != nil {
+		return nil, err
+	}
+
+	// Ungrouped aggregation — `count(x)`/`sum(x)` with no by/without, or `by ()` —
+	// collapses every series into a single empty-labelled output series. In that
+	// case the new labels are a constant `{}`, so we can skip both getLabels and
+	// patchLabels and the labels_req join against time_series entirely.
+	if s.By && len(s.Labels) == 0 {
+		return s.processNoGrouping(main, patchVal), nil
+	}
+
 	var withFp *sql.With
 	for _, w := range main.GetWith() {
 		if w.GetAlias() == "fp" {
@@ -36,11 +49,6 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 	withLabels := sql.NewWith(labels, "labels_req")
 
 	withMain := sql.NewWith(main, "pre_agg")
-
-	patchVal, err := s.patchVal()
-	if err != nil {
-		return nil, err
-	}
 
 	values := sql.NewSelect().
 		Select(
@@ -76,6 +84,46 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 		})
 	return res, nil
 
+}
+
+// processNoGrouping handles ungrouped aggregation: all series collapse into one
+// output series with empty labels (`{}`). It aggregates pre_agg by timestamp only
+// and emits a constant fingerprint, avoiding the time_series labels_req join.
+func (s *AggPlanner) processNoGrouping(main sql.ISelect, patchVal sql.SQLObject) sql.ISelect {
+	withMain := sql.NewWith(main, "pre_agg")
+	// The single output series carries empty labels `{}`; keep its fingerprint
+	// consistent with the grouped path (cityHash64 of the new labels).
+	fp := sql.NewRawObject("cityHash64('{}')")
+
+	values := sql.NewSelect().
+		Select(
+			sql.NewSimpleCol("1", "type"),
+			sql.NewCol(fp, "fingerprint"),
+			sql.NewSimpleCol("timestamp_ms", "timestamp_ms"),
+			sql.NewCol(patchVal, "val"),
+			sql.NewSimpleCol("''", "labels")).
+		From(sql.NewWithRef(withMain)).
+		GroupBy(sql.NewRawObject("timestamp_ms")).
+		OrderBy(sql.NewOrderBy(sql.NewRawObject("timestamp_ms"), sql.ORDER_BY_DIRECTION_ASC))
+
+	// One labels row, emitted only when there is at least one sample (LIMIT 1),
+	// matching the grouped path which produces label rows only for real series.
+	labelsReq := sql.NewSelect().
+		Select(
+			sql.NewSimpleCol("2", "type"),
+			sql.NewCol(fp, "fingerprint"),
+			sql.NewSimpleCol("0", "timestamp_ms"),
+			sql.NewSimpleCol("toFloat64(0)", "val"),
+			sql.NewSimpleCol("'{}'", "labels")).
+		From(sql.NewWithRef(withMain)).
+		Limit(sql.NewIntVal(1))
+
+	return sql.NewSelect().With(withMain).
+		Select(sql.NewRawObject("*")).
+		From(&unionAll{
+			ISelect: values,
+			unions:  []sql.ISelect{labelsReq},
+		})
 }
 
 func (s *AggPlanner) getLabels(withFp *sql.With, ctx *shared.PlannerContext) sql.ISelect {
