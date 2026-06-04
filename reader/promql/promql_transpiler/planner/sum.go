@@ -33,7 +33,13 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 	if s.By && len(s.Labels) == 0 {
 		return s.processNoGrouping(main, patchVal), nil
 	}
+	return s.processGrouped(main, patchVal, ctx)
+}
 
+// processGrouped aggregates per output series, joining pre_agg against the
+// relabelled time_series fingerprints (labels_req) to compute group membership.
+func (s *AggPlanner) processGrouped(main sql.ISelect, patchVal sql.SQLObject,
+	ctx *shared.PlannerContext) (sql.ISelect, error) {
 	var withFp *sql.With
 	for _, w := range main.GetWith() {
 		if w.GetAlias() == "fp" {
@@ -45,45 +51,22 @@ func (s *AggPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, error) {
 		return nil, fmt.Errorf("could not find fingerprint subquery")
 	}
 
-	labels := s.getLabels(withFp, ctx)
-	withLabels := sql.NewWith(labels, "labels_req")
-
 	withMain := sql.NewWith(main, "pre_agg")
+	withLabels := sql.NewWith(s.getLabels(withFp, ctx), "labels_req")
+	fp := sql.NewRawObject("labels_req.new_fingerprint")
+	ts := sql.NewRawObject("timestamp_ms")
 
-	values := sql.NewSelect().
-		Select(
-			sql.NewSimpleCol("1", "type"),
-			sql.NewSimpleCol("labels_req.new_fingerprint", "fingerprint"),
-			sql.NewSimpleCol("timestamp_ms", "timestamp_ms"),
-			sql.NewCol(patchVal, "val"),
-			sql.NewSimpleCol("''", "labels")).
+	values := sampleRow(fp, patchVal).
 		From(sql.NewWithRef(withMain)).
-		Join(sql.NewJoin(
-			"any left",
-			sql.NewWithRef(withLabels),
+		Join(sql.NewJoin("any left", sql.NewWithRef(withLabels),
 			sql.Eq(sql.NewRawObject("pre_agg.fingerprint"), sql.NewRawObject("labels_req.old_fingerprint")))).
-		GroupBy(sql.NewRawObject("labels_req.new_fingerprint"), sql.NewRawObject("timestamp_ms")).
-		OrderBy(
-			sql.NewOrderBy(sql.NewRawObject("labels_req.new_fingerprint"), sql.ORDER_BY_DIRECTION_ASC),
-			sql.NewOrderBy(sql.NewRawObject("timestamp_ms"), sql.ORDER_BY_DIRECTION_ASC))
+		GroupBy(fp, ts).
+		OrderBy(asc(fp), asc(ts))
 
-	labelsReq := sql.NewSelect().
-		Select(
-			sql.NewSimpleCol("2", "type"),
-			sql.NewSimpleCol("new_fingerprint", "fingerprint"),
-			sql.NewSimpleCol("0", "timestamp_ms"),
-			sql.NewSimpleCol("toFloat64(0)", "val"),
-			sql.NewSimpleCol("new_labels", "labels")).
+	labelsReq := labelsRow(sql.NewRawObject("new_fingerprint"), sql.NewRawObject("new_labels")).
 		From(sql.NewWithRef(withLabels))
 
-	res := sql.NewSelect().With(withLabels, withMain).
-		Select(sql.NewRawObject("*")).
-		From(&unionAll{
-			ISelect: values,
-			unions:  []sql.ISelect{labelsReq},
-		})
-	return res, nil
-
+	return aggResult(values, labelsReq, withLabels, withMain), nil
 }
 
 // processNoGrouping handles ungrouped aggregation: all series collapse into one
@@ -94,36 +77,55 @@ func (s *AggPlanner) processNoGrouping(main sql.ISelect, patchVal sql.SQLObject)
 	// The single output series carries empty labels `{}`; keep its fingerprint
 	// consistent with the grouped path (cityHash64 of the new labels).
 	fp := sql.NewRawObject("cityHash64('{}')")
+	ts := sql.NewRawObject("timestamp_ms")
 
-	values := sql.NewSelect().
-		Select(
-			sql.NewSimpleCol("1", "type"),
-			sql.NewCol(fp, "fingerprint"),
-			sql.NewSimpleCol("timestamp_ms", "timestamp_ms"),
-			sql.NewCol(patchVal, "val"),
-			sql.NewSimpleCol("''", "labels")).
+	values := sampleRow(fp, patchVal).
 		From(sql.NewWithRef(withMain)).
-		GroupBy(sql.NewRawObject("timestamp_ms")).
-		OrderBy(sql.NewOrderBy(sql.NewRawObject("timestamp_ms"), sql.ORDER_BY_DIRECTION_ASC))
+		GroupBy(ts).
+		OrderBy(asc(ts))
 
 	// One labels row, emitted only when there is at least one sample (LIMIT 1),
 	// matching the grouped path which produces label rows only for real series.
-	labelsReq := sql.NewSelect().
-		Select(
-			sql.NewSimpleCol("2", "type"),
-			sql.NewCol(fp, "fingerprint"),
-			sql.NewSimpleCol("0", "timestamp_ms"),
-			sql.NewSimpleCol("toFloat64(0)", "val"),
-			sql.NewSimpleCol("'{}'", "labels")).
+	labelsReq := labelsRow(fp, sql.NewRawObject("'{}'")).
 		From(sql.NewWithRef(withMain)).
 		Limit(sql.NewIntVal(1))
 
-	return sql.NewSelect().With(withMain).
+	return aggResult(values, labelsReq, withMain)
+}
+
+// sampleRow builds the type=1 (samples) row of an aggregation result with the
+// given output fingerprint and aggregated value. The caller adds FROM/JOIN,
+// GROUP BY and ORDER BY.
+func sampleRow(fingerprint, val sql.SQLObject) sql.ISelect {
+	return sql.NewSelect().Select(
+		sql.NewSimpleCol("1", "type"),
+		sql.NewCol(fingerprint, "fingerprint"),
+		sql.NewSimpleCol("timestamp_ms", "timestamp_ms"),
+		sql.NewCol(val, "val"),
+		sql.NewSimpleCol("''", "labels"))
+}
+
+// labelsRow builds the type=2 (labels metadata) row carrying the output series'
+// labels. The caller adds FROM (and any LIMIT).
+func labelsRow(fingerprint, labels sql.SQLObject) sql.ISelect {
+	return sql.NewSelect().Select(
+		sql.NewSimpleCol("2", "type"),
+		sql.NewCol(fingerprint, "fingerprint"),
+		sql.NewSimpleCol("0", "timestamp_ms"),
+		sql.NewSimpleCol("toFloat64(0)", "val"),
+		sql.NewCol(labels, "labels"))
+}
+
+// aggResult unions the samples and labels rows into the final result, declaring
+// the supplied CTEs.
+func aggResult(values, labelsReq sql.ISelect, withs ...*sql.With) sql.ISelect {
+	return sql.NewSelect().With(withs...).
 		Select(sql.NewRawObject("*")).
-		From(&unionAll{
-			ISelect: values,
-			unions:  []sql.ISelect{labelsReq},
-		})
+		From(&unionAll{ISelect: values, unions: []sql.ISelect{labelsReq}})
+}
+
+func asc(col sql.SQLObject) sql.SQLObject {
+	return sql.NewOrderBy(col, sql.ORDER_BY_DIRECTION_ASC)
 }
 
 func (s *AggPlanner) getLabels(withFp *sql.With, ctx *shared.PlannerContext) sql.ISelect {
