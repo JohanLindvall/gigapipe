@@ -115,6 +115,11 @@ func (s *AggPlanner) patchVal() (sql.SQLObject, error) {
 	switch s.Fn {
 	case "sum":
 		return sql.NewRawObject("sum(val)"), nil
+	case "count":
+		// PromQL count() counts the series in each group at each timestamp; after
+		// the join every contributing series is one row, so count() of the rows
+		// yields the series count. The result is a float like any other sample.
+		return sql.NewRawObject("toFloat64(count())"), nil
 	}
 	return nil, fmt.Errorf("unknown function: %s", s.Fn)
 }
