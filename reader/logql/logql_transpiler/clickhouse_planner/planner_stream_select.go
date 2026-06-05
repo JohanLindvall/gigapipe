@@ -54,11 +54,22 @@ func (s *StreamSelectPlanner) Process(ctx *shared.PlannerContext) (sql.ISelect, 
 		case "!=":
 			valClause = sql.Neq(sql.NewRawObject("val"), sql.NewStringVal(s.Values[i]))
 		case "=~":
-			valClause = sql.Eq(&SqlMatch{
-				col: sql.NewRawObject("val"), pattern: s.Values[i]}, sql.NewIntVal(1))
+			// `.+` is the canonical PromQL "match all" matcher (`__name__=~".+"`).
+			// It is equivalent to "value is present and non-empty", so emit a cheap
+			// notEmpty() check instead of compiling and running a regex per row.
+			if s.Values[i] == matchAllNonEmptyRegex {
+				valClause = sql.Eq(sqlValNotEmpty(), sql.NewIntVal(1))
+			} else {
+				valClause = sql.Eq(&SqlMatch{
+					col: sql.NewRawObject("val"), pattern: s.Values[i]}, sql.NewIntVal(1))
+			}
 		case "!~":
-			valClause = sql.Eq(&SqlMatch{
-				col: sql.NewRawObject("val"), pattern: s.Values[i]}, sql.NewIntVal(0))
+			if s.Values[i] == matchAllNonEmptyRegex {
+				valClause = sql.Eq(sqlValNotEmpty(), sql.NewIntVal(0))
+			} else {
+				valClause = sql.Eq(&SqlMatch{
+					col: sql.NewRawObject("val"), pattern: s.Values[i]}, sql.NewIntVal(0))
+			}
 		default:
 			return nil, &shared.NotSupportedError{
 				Msg: fmt.Sprintf("%s op not supported", s.Ops[i]),

@@ -9,6 +9,18 @@ import (
 	sql "github.com/metrico/qryn/v4/reader/utils/sql_select"
 )
 
+// matchAllNonEmptyRegex is the canonical PromQL "match all series" regex. PromQL
+// forbids `.*` as the sole matcher, so `{__name__=~".+"}` is the idiomatic way to
+// select everything. It is equivalent to "value present and non-empty".
+const matchAllNonEmptyRegex = ".+"
+
+// sqlValNotEmpty renders `notEmpty(val)`, a cheap stand-in for `match(val, '.+')`.
+func sqlValNotEmpty() sql.SQLObject {
+	return sql.NewCustomCol(func(ctx *sql.Ctx, options ...int) (string, error) {
+		return "notEmpty(val)", nil
+	})
+}
+
 type SqlMatch struct {
 	col        sql.SQLObject
 	pattern    string

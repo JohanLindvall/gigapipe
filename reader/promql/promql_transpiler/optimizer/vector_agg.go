@@ -23,7 +23,7 @@ func (v *Aggregate) Applicable(expr prom_parser.Expr) bool {
 		return false
 	}
 	switch _expr.Op {
-	case prom_parser.SUM:
+	case prom_parser.SUM, prom_parser.COUNT:
 		return true
 	}
 	return false
@@ -33,15 +33,21 @@ func (v *Aggregate) Optimize(gExpr *promql_parser.Expr, expr prom_parser.Expr) (
 	v.gExpr = gExpr
 	v.expr = expr.(*prom_parser.AggregateExpr)
 	v.selector = v.expr.Expr.(*prom_parser.VectorSelector)
-	return v.sum(), nil
+	return v.agg(aggFn[v.expr.Op]), nil
 }
 
-func (v *Aggregate) sum() prom_parser.Expr {
+// aggFn maps a PromQL aggregation operator to the name understood by AggPlanner.
+var aggFn = map[prom_parser.ItemType]string{
+	prom_parser.SUM:   "sum",
+	prom_parser.COUNT: "count",
+}
+
+func (v *Aggregate) agg(fn string) prom_parser.Expr {
 	p := planner.AggPlanner{
 		Main:   nil,
 		Labels: v.expr.Grouping,
 		By:     !v.expr.Without,
-		Fn:     "sum",
+		Fn:     fn,
 	}
 
 	if v.gExpr.Substitutes[v.selector.Name] != nil {
